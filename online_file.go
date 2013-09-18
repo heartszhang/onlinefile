@@ -3,10 +3,34 @@ package onlinefile
 import (
 	"fmt"
 	"io"
-	//	"log"
+	"io/ioutil"
+	"log"
 	"net/http"
+	"os"
 	"strconv"
+	"strings"
 	"sync"
+)
+
+const (
+	_16K = 16384
+	_1M  = 1024 * 1024
+	_1K  = 1024
+	_1B  = 256
+)
+const (
+	status_recv_200 = 1 << iota
+	status_recv_206
+)
+const (
+	status_failed_0 = -iota
+	status_closed
+	status_failed_invalidrange
+	status_failed_badrequest
+	status_failed_statuscode
+	status_recv_failed
+
+	slice8 = 8 //
 )
 
 type OnlineFile interface {
@@ -29,33 +53,23 @@ type HttpRangeFile struct {
 
 	status int // < 0 : error-code, 0 : working, 1 : done, 2 : closed
 	error  error
+
+	fragments []*os.File
 }
 
-const (
-	_16K = 16384
-	_1M  = 1024 * 1024
-	_1K  = 1024
-	_1B  = 256
-
-	status_recv_200 = 1 << iota
-	status_recv_206
-
-	status_failed_0 = -iota
-	status_closed
-	status_failed_invalidrange
-	status_failed_badrequest
-	status_failed_statuscode
-	status_recv_failed
-
-	slice8 = 8 //
-)
+/*
+fragments
+write
+read
+resize
+*/
 
 func NewHttpRangeFile(uri string) OnlineFile {
 	l := &sync.Mutex{}
 	v := &HttpRangeFile{
 		uri:        uri,
 		packets:    make(chan *packet, _1B),
-		slices:     new_online_fd(_16K, _1K),
+		slices:     new_file_desc(_16K, _1K),
 		slice_size: _1K,
 		lock:       l,
 		update:     sync.NewCond(l)}
@@ -63,8 +77,53 @@ func NewHttpRangeFile(uri string) OnlineFile {
 	return v
 }
 
+func (this *HttpRangeFile) Read(buf []byte) (n int, err error) {
+	this.update.L.Lock()
+	for !this.readable() {
+		this.update.Wait()
+	}
+	c := min(this.avail(), int64(len(buf)))
+	this.update.L.Unlock()
+
+	for c > 0 {
+		idx := this.read_pointer / fragment_size
+		in_frag := this.read_pointer % fragment_size
+		l := min(c, fragment_size-in_frag)
+		led, err := this.read_from_fragment(int(idx), in_frag, buf[n:n+int(l)])
+		this.read_pointer += int64(led)
+		c -= int64(led)
+		n += led
+		if err != nil && err != io.EOF {
+			break
+		}
+		if err == io.EOF {
+			err = nil
+		}
+	}
+	return
+}
+
+func (this *HttpRangeFile) Seek(offset int64, whence int) (ret int64, err error) {
+	this.lock.Lock()
+	switch whence {
+	case 0:
+		this.read_pointer = offset
+	case 1:
+		this.read_pointer += offset
+	case 2:
+		this.read_pointer = this.length - offset
+	}
+	ret = this.read_pointer
+	c := this.avail()
+	this.lock.Unlock()
+	if c > slice8*this.slice_size {
+		log.Println(ret, "seek triges another worker")
+		go this.work()
+	}
+	return ret, nil
+}
+
 const (
-	unsupported_status    = `unsupported status`
 	max_cocurrent_workers = 2 // enable 2 workers cocurrent
 )
 
@@ -116,7 +175,8 @@ func (this *HttpRangeFile) unready(slices int) (begin, end int) {
 	}
 	rpidx := int(this.read_pointer / this.slice_size)
 	begin, end = this.slices.unready_after(rpidx, slice8)
-	//没有需要下载的内容
+
+	//没有需要下载的内容, 从头开始搜索未下载的内容
 	if begin == end && this.read_pointer != 0 {
 		begin, end = this.slices.unready_after(0, slice8)
 	}
@@ -144,6 +204,7 @@ func (this *HttpRangeFile) new_request(begin, end int) (*http.Request, int64, in
 		req.Header.Add(`Connection`, `keep-alive`)
 		req.Header.Add(`Range`, print_http_range(first, last))
 	}
+	log.Println(first, last, `new http request`)
 	return req, first, last, err
 }
 
@@ -162,6 +223,7 @@ func (this *HttpRangeFile) error_and_close(status int, err error) {
 	this.status = status
 	this.error = err
 	this.Close()
+	// trig all reads to fail
 	this.update.Broadcast()
 }
 
@@ -169,58 +231,56 @@ func (this *HttpRangeFile) error_and_close(status int, err error) {
 func (this *HttpRangeFile) Close() error {
 	this.status = status_closed
 	this.packets <- nil
+	fs := this.fragments
+	this.fragments = make([]*os.File, 0)
+	for _, f := range fs {
+		f.Close()
+	}
 	return nil
 }
 
+const (
+	_16M          int64 = 16 * 1024 * 1024
+	fragment_size       = _16M
+)
+
 //文件初始长度和真实长度不一致，下载过程中，如果服务器回送的文件长度发生变化
 //都需要重新设定文件长度，但是文件数据不会被清理。这有可能导致文件内容错误
-func (this *HttpRangeFile) try_reset_length(len int64) {
+func (this *HttpRangeFile) try_reset_length(length int64) {
 	this.lock.Lock()
 	defer this.lock.Unlock()
-	if len == this.length || len < 0 {
+	if length == this.length || length < 0 {
 		return
 	}
-	this.length = len
-	this.slices.resize(len, this.slice_size)
-}
-
-//记录正在工作的下载器
-func (this *HttpRangeFile) register_work() int {
-	this.lock.Lock()
-	defer this.lock.Unlock()
-	v := this.workers
-	this.workers++
-	return v
-}
-func (this *HttpRangeFile) unregister_work() int {
-	this.lock.Lock()
-	defer this.lock.Unlock()
-	v := this.workers
-	this.workers--
-	return v
-}
-
-func (this *HttpRangeFile) Read([]byte) (n int, err error) {
-	//	c := this.slices.avail_after(this.read_pointer)
-	//	c := avail()
-	this.update.L.Lock()
-	for !this.readable() {
-		this.update.Wait()
+	fragment_count := (length + fragment_size - 1) / fragment_size
+	if len(this.fragments) < int(fragment_count) {
+		for i := int(fragment_count); i < len(this.fragments); i++ {
+			this.fragments[i].Close()
+		}
+		this.fragments = this.fragments[:fragment_count]
+	} else if len(this.fragments) > int(fragment_count) {
+		nfs := make([]*os.File, fragment_count)
+		copy(nfs, this.fragments)
+		for i := len(this.fragments); i < int(fragment_count); i++ {
+			nfs[i], _ = ioutil.TempFile(``, ``)
+		}
+		this.fragments = nfs
 	}
-	defer this.update.L.Unlock()
-	// c := avail()	// file bytes
-	// to be implemented
-	return 0, nil
-}
-
-func (this *HttpRangeFile) Seek(offset int64, whence int) (ret int64, err error) {
-	return 0, nil
+	this.length = length
+	this.slices.resize(length, this.slice_size)
 }
 
 func (this *HttpRangeFile) readable() bool {
 	rpidx := int(this.read_pointer / this.slice_size)
 	c := this.slices.avail_after(rpidx)
 	return c > 0 || this.status < 0
+}
+
+// needn't lock
+func (this *HttpRangeFile) avail() int64 {
+	rpidx := this.read_pointer / this.slice_size
+	c := this.slices.avail_after(int(rpidx))
+	return int64(c) * this.slice_size
 }
 
 //分片下载过程
@@ -256,44 +316,38 @@ func (this *HttpRangeFile) work() {
 		if e == nil {
 			this.try_reset_length(l)
 		}
+		log.Println(this.length, `status 200`)
 		this.do_receive(resp, 0, this.length)
 	case http.StatusPartialContent:
 		if this.unaccept_206() {
 			return
 		}
 		//如果first位置和我们请求的并不一致，没有按照分片进行对齐，程序处理不了这种情况
-		first, last, total := parse_content_range(resp.Header.Get(`Content-Range`))
+		first, last, total, _ := parse_content_range(resp.Header.Get(`Content-Range`))
+		log.Println(first, last, total, `status 206`)
 		this.try_reset_length(total)
 		err = this.do_receive(resp, first, last+1)
 		if err == nil {
 			go this.work()
 		}
 	default:
-		err = fmt.Errorf(`%v: %v`, resp.StatusCode, unsupported_status)
+		err = fmt.Errorf(`%v: unsupported http response`, resp.StatusCode)
 		this.error_and_close(status_failed_statuscode, err)
 	}
 }
 
-func parse_content_range(header string) (first, last, total int64) {
-	return 0, 0, 0
-}
-
 //读满缓冲区或者EOF或者出现错误
-func read_until_full(reader io.Reader, buf []byte) (int, error) {
-	offset := 0
-	for {
-		x, e := reader.Read(buf[offset:])
-		offset += x
-		if offset >= len(buf) {
-			return offset, e
-		}
-		if e != nil || x == 0 {
-			return offset, e
-		}
+func read_until_full(reader io.Reader, buf []byte) (n int, err error) {
+	var x int
+	for n < len(buf) && err == nil {
+		x, err = reader.Read(buf[n:])
+		n += x
 	}
+	return
 }
 
 func (this *HttpRangeFile) write_fragment_imp(buf []byte, begin, size int64) {
+	log.Println(begin, size, `write-fragment`)
 	if begin%this.slice_size != 0 {
 		// write a log
 		return
@@ -315,12 +369,10 @@ func (this *HttpRangeFile) write_fragment(buf []byte, begin, count int64) {
 	this.packets <- p
 }
 
-const ()
-
 func (this *HttpRangeFile) do_receive(resp *http.Response, begin, end int64) error {
 	buf := make([]byte, _1K)
 	for {
-		n, e := read_until_full(resp.Body, buf) // resp.Body.Read(buf)
+		n, e := read_until_full(resp.Body, buf)
 		if n > 0 {
 			this.write_fragment(buf, begin, int64(n))
 			begin += int64(n)
@@ -334,4 +386,66 @@ func (this *HttpRangeFile) do_receive(resp *http.Response, begin, end int64) err
 		}
 	}
 	return nil
+}
+
+//记录正在工作的下载器
+func (this *HttpRangeFile) register_work() int {
+	this.lock.Lock()
+	defer this.lock.Unlock()
+	v := this.workers
+	this.workers++
+	return v
+}
+func (this *HttpRangeFile) unregister_work() int {
+	this.lock.Lock()
+	defer this.lock.Unlock()
+	v := this.workers
+	this.workers--
+	return v
+}
+
+/*
+Content-Range = "Content-Range" ":" content-range-spec
+       content-range-spec      = byte-content-range-spec
+       byte-content-range-spec = bytes-unit SP
+                                 byte-range-resp-spec "/"
+                                 ( instance-length | "*" )
+       byte-range-resp-spec = (first-byte-pos "-" last-byte-pos)
+                                      | "*"
+       instance-length           = 1*DIGIT
+*/
+func parse_content_range(header string) (first, last, total int64, err error) {
+	spec := strings.Fields(header)
+	if len(spec) < 2 { // bytes
+		err = fmt.Errorf(`invalid header: %v`, header)
+		return
+	}
+	bspec := strings.Split(spec[1], `/`) // xxxx-xxxx/xxxx
+	if len(bspec) < 2 {
+		err = fmt.Errorf(`invalid header: %v`, spec[1])
+		return
+	}
+	rspec := strings.Split(bspec[0], `-`) // xxxx-xxxxx
+	if len(rspec) != 2 {
+		err = fmt.Errorf(`invalid header: %v`, bspec[0])
+	}
+	//total = bspec[1], first = rspec[0], last = rspec[1]
+	first, err = strconv.ParseInt(rspec[0], 10, 0)
+	if err == nil {
+		last, err = strconv.ParseInt(rspec[1], 10, 0)
+	}
+	if err == nil {
+		total, err = strconv.ParseInt(bspec[1], 10, 0)
+	}
+	return
+}
+
+func (this *HttpRangeFile) read_from_fragment(frag_idx int, offset int64, buf []byte) (n int, err error) {
+	if frag_idx < 0 || frag_idx >= len(this.fragments) {
+		err = fmt.Errorf(`read fragment out of range [%d]/%d`, frag_idx, offset)
+		return
+	}
+	frag := this.fragments[frag_idx]
+	frag.Seek(offset, 0)
+	return frag.Read(buf)
 }
