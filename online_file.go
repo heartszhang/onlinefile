@@ -29,6 +29,7 @@ const (
 	status_failed_badrequest
 	status_failed_statuscode
 	status_recv_failed
+	status_done
 
 	slice8 = 8 //
 )
@@ -54,7 +55,8 @@ type HttpRangeFile struct {
 	status int // < 0 : error-code, 0 : working, 1 : done, 2 : closed
 	error  error
 
-	fragments []*os.File
+	fragments     []*os.File
+	fragment_size int64
 }
 
 /*
@@ -67,12 +69,13 @@ resize
 func NewHttpRangeFile(uri string) OnlineFile {
 	l := &sync.Mutex{}
 	v := &HttpRangeFile{
-		uri:        uri,
-		packets:    make(chan *packet, _1B),
-		slices:     new_file_desc(_16K, _1K),
-		slice_size: _1K,
-		lock:       l,
-		update:     sync.NewCond(l)}
+		uri:           uri,
+		packets:       make(chan *packet, _1B),
+		slices:        new_file_desc(_16K, _1K),
+		slice_size:    _1K,
+		fragment_size: _16M,
+		lock:          l,
+		update:        sync.NewCond(l)}
 	go v.work()
 	return v
 }
@@ -85,21 +88,26 @@ func (this *HttpRangeFile) Read(buf []byte) (n int, err error) {
 	c := min(this.avail(), int64(len(buf)))
 	this.update.L.Unlock()
 
+L:
 	for c > 0 {
-		idx := this.read_pointer / fragment_size
-		in_frag := this.read_pointer % fragment_size
-		l := min(c, fragment_size-in_frag)
-		led, err := this.read_from_fragment(int(idx), in_frag, buf[n:n+int(l)])
+		idx := this.read_pointer / this.fragment_size
+		in_frag := this.read_pointer % this.fragment_size
+		l := min(c, this.fragment_size-in_frag)
+		var led int
+		led, err = this.read_from_fragment(int(idx), in_frag, buf[n:n+int(l)])
 		this.read_pointer += int64(led)
 		c -= int64(led)
 		n += led
-		if err != nil && err != io.EOF {
-			break
-		}
-		if err == io.EOF {
+		log.Println(`frag:`, idx, `infrag`, in_frag, `pointer`, this.read_pointer, c, `readed`, n, led, `read slice`)
+		switch err {
+		default:
+			break L
+		case nil:
+		case io.EOF:
 			err = nil
 		}
 	}
+	log.Println(`readed:`, n, err, `Read done`)
 	return
 }
 
@@ -196,6 +204,9 @@ func min(lhs, rhs int64) int64 {
 func (this *HttpRangeFile) new_request(begin, end int) (*http.Request, int64, int64, error) {
 	first := int64(begin) * this.slice_size
 	last := min(int64(end)*this.slice_size, this.length) - 1
+	if this.length == 0 {
+		last = int64(end)*this.slice_size - 1
+	}
 	if last <= first {
 		return nil, first, last, fmt.Errorf(`%v : invalid range`, status_failed_invalidrange)
 	}
@@ -204,7 +215,6 @@ func (this *HttpRangeFile) new_request(begin, end int) (*http.Request, int64, in
 		req.Header.Add(`Connection`, `keep-alive`)
 		req.Header.Add(`Range`, print_http_range(first, last))
 	}
-	log.Println(first, last, `new http request`)
 	return req, first, last, err
 }
 
@@ -222,7 +232,9 @@ func (this *HttpRangeFile) error_and_close(status int, err error) {
 	defer this.lock.Unlock()
 	this.status = status
 	this.error = err
-	this.Close()
+	if err != nil {
+		this.Close()
+	}
 	// trig all reads to fail
 	this.update.Broadcast()
 }
@@ -240,8 +252,10 @@ func (this *HttpRangeFile) Close() error {
 }
 
 const (
-	_16M          int64 = 16 * 1024 * 1024
-	fragment_size       = _16M
+	_16M int64 = 16 * 1024 * 1024
+	_1G  int64 = 1024 * 1024 * 1024
+
+//	fragment_default_size       = _16M
 )
 
 //文件初始长度和真实长度不一致，下载过程中，如果服务器回送的文件长度发生变化
@@ -249,22 +263,37 @@ const (
 func (this *HttpRangeFile) try_reset_length(length int64) {
 	this.lock.Lock()
 	defer this.lock.Unlock()
-	if length == this.length || length < 0 {
+	if length == this.length {
 		return
 	}
-	fragment_count := (length + fragment_size - 1) / fragment_size
-	if len(this.fragments) < int(fragment_count) {
-		for i := int(fragment_count); i < len(this.fragments); i++ {
-			this.fragments[i].Close()
+	if length < 0 {
+		this.fragment_size = _1G
+	}
+	fragment_count := (length + this.fragment_size - 1) / this.fragment_size
+	if fragment_count == 0 { // when transfer-encoding: chunked
+		fragment_count = 1
+	}
+	log.Println(`frag-count:`, fragment_count, `total:`, length, `reset length`)
+
+	switch {
+	default:
+	case this.fragments == nil:
+		this.fragments = make([]*os.File, fragment_count)
+		for i := 0; i < int(fragment_count); i++ {
+			this.fragments[i], _ = ioutil.TempFile(``, ``)
 		}
-		this.fragments = this.fragments[:fragment_count]
-	} else if len(this.fragments) > int(fragment_count) {
+	case len(this.fragments) < int(fragment_count):
 		nfs := make([]*os.File, fragment_count)
 		copy(nfs, this.fragments)
 		for i := len(this.fragments); i < int(fragment_count); i++ {
 			nfs[i], _ = ioutil.TempFile(``, ``)
 		}
 		this.fragments = nfs
+	case len(this.fragments) > int(fragment_count):
+		for i := int(fragment_count); i < len(this.fragments); i++ {
+			this.fragments[i].Close()
+		}
+		this.fragments = this.fragments[:fragment_count]
 	}
 	this.length = length
 	this.slices.resize(length, this.slice_size)
@@ -296,7 +325,11 @@ func (this *HttpRangeFile) work() {
 	if begin == end {
 		return
 	}
-	req, _, _, _ := this.new_request(begin, end)
+	req, _, _, err := this.new_request(begin, end)
+	if err != nil {
+		this.error_and_close(status_failed_badrequest, err)
+		return
+	}
 	client := new_range_http_client() // disable gzip
 	resp, err := client.Do(req)
 	if err != nil {
@@ -312,11 +345,8 @@ func (this *HttpRangeFile) work() {
 		//传输使用了Transfer-encoding:chunked或者长度未知的情况下content-length都不会有
 		// 这种情况我们目前是不支持的
 		//	te := resp.Header.Get(`Transfer-Encoding`)
-		l, e := strconv.ParseInt(resp.Header.Get(`Content-Length`), 10, 0)
-		if e == nil {
-			this.try_reset_length(l)
-		}
-		log.Println(this.length, `status 200`)
+		log.Println(`content-length`, resp.ContentLength)
+		this.try_reset_length(resp.ContentLength)
 		this.do_receive(resp, 0, this.length)
 	case http.StatusPartialContent:
 		if this.unaccept_206() {
@@ -343,17 +373,33 @@ func read_until_full(reader io.Reader, buf []byte) (n int, err error) {
 		x, err = reader.Read(buf[n:])
 		n += x
 	}
+	log.Println(`bytes:`, n, `read until full`)
 	return
 }
 
 func (this *HttpRangeFile) write_fragment_imp(buf []byte, begin, size int64) {
-	log.Println(begin, size, `write-fragment`)
+	log.Println(`begin:`, begin, `size:`, size, `write-fragment`, len(this.fragments))
 	if begin%this.slice_size != 0 {
 		// write a log
 		return
 	}
+	var offset int64 = 0
+	for offset < size {
+		frag_idx := int((begin + offset) / this.fragment_size)
+		in_frag := (begin + offset) % this.fragment_size
+		l := min(size-offset, this.fragment_size-in_frag)
+		n, _ := this.fragments[frag_idx].WriteAt(buf[int(offset):int(offset+l)], in_frag)
+		offset += int64(n)
+		log.Println(`bytes:`, n, `writed to fragment`, frag_idx)
+	}
+	if this.length < 0 {
+		this.update.Broadcast()
+		// slice-table is disabled
+		return
+	}
 	idx := begin / this.slice_size
 	end := (size+this.slice_size-1)/this.slice_size + idx
+
 	this.lock.Lock()
 	defer this.lock.Unlock()
 	for i := idx; i < end; i++ {
@@ -362,15 +408,18 @@ func (this *HttpRangeFile) write_fragment_imp(buf []byte, begin, size int64) {
 	this.update.Broadcast()
 }
 
-func (this *HttpRangeFile) write_fragment(buf []byte, begin, count int64) {
-	p := &packet{offset: begin}
-	p.data = make([]byte, count)
-	copy(p.data, buf)
-	this.packets <- p
+func (this *HttpRangeFile) write_fragment(buf []byte, begin, size int64) {
+	/*	p := &packet{offset: begin}
+		p.data = make([]byte, count)
+		copy(p.data, buf)
+		this.packets <- p
+	*/
+	this.write_fragment_imp(buf, begin, size)
 }
 
 func (this *HttpRangeFile) do_receive(resp *http.Response, begin, end int64) error {
 	buf := make([]byte, _1K)
+L:
 	for {
 		n, e := read_until_full(resp.Body, buf)
 		if n > 0 {
@@ -379,12 +428,14 @@ func (this *HttpRangeFile) do_receive(resp *http.Response, begin, end int64) err
 		}
 		switch {
 		case n == 0 || e == io.EOF:
-			break
+			this.error_and_close(status_done, nil)
+			break L
 		case e != nil:
 			this.error_and_close(status_recv_failed, e)
 			return e
 		}
 	}
+	log.Println(`do-receive done`)
 	return nil
 }
 

@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	o "github.com/heartszhang/onlinefile"
 	"net/http"
 	"strconv"
 	"strings"
@@ -10,12 +11,25 @@ import (
 import ()
 
 var (
-	uri    = flag.String("uri", "", "url path")
+	uri    = flag.String("uri", "http://www.sina.com.cn", "url path")
 	rstart = flag.Int("start", 0, "range start")
 	rend   = flag.Int("end", 1024, "range end")
 )
 
 func main() {
+	flag.Parse()
+	if *uri == "" {
+		flag.PrintDefaults()
+		return
+	}
+	hrf := o.NewHttpRangeFile(*uri)
+	buf := make([]byte, 512)
+	for n, e := hrf.Read(buf); n > 0; n, e = hrf.Read(buf) {
+		fmt.Println(e, `read 512 bytes`)
+	}
+}
+
+func main1() {
 	flag.Parse()
 	if *uri == "" {
 		flag.PrintDefaults()
