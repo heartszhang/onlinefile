@@ -11,7 +11,7 @@ import (
 import ()
 
 var (
-	uri    = flag.String("uri", "http://www.sina.com.cn", "url path")
+	uri    = flag.String("uri", "http://6pingm.com/v/127505.html", "url path")
 	rstart = flag.Int("start", 0, "range start")
 	rend   = flag.Int("end", 1024, "range end")
 )
@@ -24,9 +24,14 @@ func main() {
 	}
 	hrf := o.NewHttpRangeFile(*uri)
 	buf := make([]byte, 512)
-	for n, e := hrf.Read(buf); n > 0; n, e = hrf.Read(buf) {
-		fmt.Println(e, `read 512 bytes`)
+	for n, _ := hrf.Read(buf); n > 0; n, _ = hrf.Read(buf) {
+		//		fmt.Println(e, `read 512 bytes`)
 	}
+	fmt.Println(`read one`)
+	for n, _ := hrf.Read(buf); n > 0; n, _ = hrf.Read(buf) {
+		//		fmt.Println(e, `read 512 bytes`)
+	}
+	fmt.Println(`read one`)
 }
 
 func main1() {

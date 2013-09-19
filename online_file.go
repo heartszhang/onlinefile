@@ -98,16 +98,16 @@ L:
 		this.read_pointer += int64(led)
 		c -= int64(led)
 		n += led
-		log.Println(`frag:`, idx, `infrag`, in_frag, `pointer`, this.read_pointer, c, `readed`, n, led, `read slice`)
+
 		switch err {
 		default:
 			break L
 		case nil:
 		case io.EOF:
-			err = nil
+
+			break L
 		}
 	}
-	log.Println(`readed:`, n, err, `Read done`)
 	return
 }
 
@@ -132,7 +132,7 @@ func (this *HttpRangeFile) Seek(offset int64, whence int) (ret int64, err error)
 }
 
 const (
-	max_cocurrent_workers = 2 // enable 2 workers cocurrent
+	max_cocurrent_workers = 3 // enable 2 workers cocurrent
 )
 
 //http-server回应200ok，在下面一些情况不接受这些数据
@@ -314,6 +314,7 @@ func (this *HttpRangeFile) avail() int64 {
 
 //分片下载过程
 func (this *HttpRangeFile) work() {
+	log.Println(`enter work`)
 	var workers = this.register_work()
 	defer this.unregister_work()
 	if workers > max_cocurrent_workers { // too many workers
@@ -323,8 +324,10 @@ func (this *HttpRangeFile) work() {
 	//begin, end是分片下标
 	begin, end := this.unready(slice8)
 	if begin == end {
+		this.error_and_close(status_done, nil)
 		return
 	}
+	log.Println(begin, end, `should some work be done`)
 	req, _, _, err := this.new_request(begin, end)
 	if err != nil {
 		this.error_and_close(status_failed_badrequest, err)
@@ -347,7 +350,10 @@ func (this *HttpRangeFile) work() {
 		//	te := resp.Header.Get(`Transfer-Encoding`)
 		log.Println(`content-length`, resp.ContentLength)
 		this.try_reset_length(resp.ContentLength)
-		this.do_receive(resp, 0, this.length)
+		err = this.do_receive(resp, 0, this.length)
+		if err == nil {
+			this.error_and_close(status_done, nil)
+		}
 	case http.StatusPartialContent:
 		if this.unaccept_206() {
 			return
@@ -358,6 +364,7 @@ func (this *HttpRangeFile) work() {
 		this.try_reset_length(total)
 		err = this.do_receive(resp, first, last+1)
 		if err == nil {
+			log.Println(`begin work`)
 			go this.work()
 		}
 	default:
@@ -373,12 +380,11 @@ func read_until_full(reader io.Reader, buf []byte) (n int, err error) {
 		x, err = reader.Read(buf[n:])
 		n += x
 	}
-	log.Println(`bytes:`, n, `read until full`)
 	return
 }
 
 func (this *HttpRangeFile) write_fragment_imp(buf []byte, begin, size int64) {
-	log.Println(`begin:`, begin, `size:`, size, `write-fragment`, len(this.fragments))
+	//	log.Println(`begin:`, begin, `size:`, size, `write-fragment`, len(this.fragments))
 	if begin%this.slice_size != 0 {
 		// write a log
 		return
@@ -391,11 +397,6 @@ func (this *HttpRangeFile) write_fragment_imp(buf []byte, begin, size int64) {
 		n, _ := this.fragments[frag_idx].WriteAt(buf[int(offset):int(offset+l)], in_frag)
 		offset += int64(n)
 		log.Println(`bytes:`, n, `writed to fragment`, frag_idx)
-	}
-	if this.length < 0 {
-		this.update.Broadcast()
-		// slice-table is disabled
-		return
 	}
 	idx := begin / this.slice_size
 	end := (size+this.slice_size-1)/this.slice_size + idx
@@ -428,7 +429,7 @@ L:
 		}
 		switch {
 		case n == 0 || e == io.EOF:
-			this.error_and_close(status_done, nil)
+			//			this.error_and_close(status_done, nil)
 			break L
 		case e != nil:
 			this.error_and_close(status_recv_failed, e)

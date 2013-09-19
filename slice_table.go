@@ -1,9 +1,5 @@
 package onlinefile
 
-import ()
-
-import ()
-
 const (
 	slice_entry_bits byte = 2 // 2 bits
 	slice_entry_mask byte = 1<<slice_entry_bits - 1
@@ -37,6 +33,9 @@ func new_file_desc(length, slice_size int64) slice_table {
 }
 
 func (this *file_desc) resize(length, slice_size int64) {
+	if length < 0 {
+		length = _16M
+	}
 	slice_count := (length + slice_size - 1) / slice_size
 	data_length := int(slice_count+byte_bits-1) / byte_bits * int(slice_entry_bits)
 
@@ -71,6 +70,14 @@ func (this *file_desc) update(index int, status slice_entry) slice_entry {
 	c := byte_bits / int(slice_entry_bits)
 	bidx := index / c
 	in_byte := index % c
+
+	if bidx >= len(*this) { // need a expand
+		nl := (bidx + _1K)
+		nfd := make(file_desc, nl)
+		copy(nfd, *this)
+		*this = nfd
+	}
+
 	v := (*this)[bidx]
 	l := status << (byte(in_byte) * slice_entry_bits)
 	mask := ^(slice_entry_mask << (byte(in_byte) * slice_entry_bits))
